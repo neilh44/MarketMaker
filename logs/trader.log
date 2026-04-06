@@ -18428,3 +18428,41 @@
 18:55:17 INFO    main     STATUS | mid=0.1585 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390014 llm_calls=101
 18:55:17 WARNING engine   Order rejected [-2019]: Margin is insufficient.
 18:55:17 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:20 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:20 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:20 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:22 INFO    main     STATUS | mid=0.1586 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390015 llm_calls=101
+18:55:23 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:24 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:24 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:26 INFO    engine   POSITION RAW | side=LONG positionAmt=259 qty=259.0 entry=0.1584357142857
+18:55:26 INFO    engine   POSITION RAW | side=SHORT positionAmt=-296 qty=296.0 entry=0.15840375
+18:55:26 INFO    engine   POSITION SUMMARY | long=259.0@0.158436 short=296.0@0.158404
+18:55:26 INFO    engine   EXIT STATE | long_tp=set long_sl=set short_tp=set short_sl=set
+18:55:27 INFO    main     STATUS | mid=0.1586 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390016 llm_calls=101
+18:55:28 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:28 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:28 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:31 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:32 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:32 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:32 INFO    llm      LLM #102 (728ms) -> spread=12.0bps skew=0.0 paused=False regime=low_vol | Volatility is low and conditions are stable.
+18:55:32 INFO    main     STATUS | mid=0.1586 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390018 llm_calls=102
+18:55:34 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:35 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:35 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:37 INFO    main     STATUS | mid=0.1584 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390019 llm_calls=102
+18:55:37 INFO    engine   POSITION RAW | side=LONG positionAmt=259 qty=259.0 entry=0.1584357142857
+18:55:37 INFO    engine   POSITION RAW | side=SHORT positionAmt=-296 qty=296.0 entry=0.15840375
+18:55:37 INFO    engine   POSITION SUMMARY | long=259.0@0.158436 short=296.0@0.158404
+18:55:37 INFO    engine   EXIT STATE | long_tp=set long_sl=set short_tp=set short_sl=set
+18:55:39 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:39 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:39 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:42 INFO    main     STATUS | mid=0.1586 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390021 llm_calls=102
+18:55:42 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:43 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:43 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:45 WARNING engine   Order rejected [-2019]: Margin is insufficient.
+18:55:46 WARNING engine   Order placement failed 1x — backing off 2s
+18:55:47 INFO    main     STATUS | mid=0.1588 spread=12.0bps skew=+0.00 paused=False regime=low_vol | PnL R=+0.0000 U=+0.0000 W/L=0/0 | ticks=2390022 llm_calls=102
