@@ -170,7 +170,7 @@ Example response:
                 tp_bps=float(llm_response.get("tp_bps", 40.0)),
                 position_multiple=float(llm_response.get("position_multiple", 1.1)),
             )
-            self.state.update_params(**new_params.__dict__)
+            await self.state.update_params(**new_params.__dict__)
             self._call_count += 1
 
             log.info(
