@@ -117,7 +117,7 @@ class QuotingEngine:
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def _fetch_symbol_info(self):
-        """Fetch lot size and set leverage to 10x."""
+        """Fetch lot size, set leverage to 10x, and enable Hedge Mode."""
         url = f"{BINANCE_REST}/fapi/v1/exchangeInfo"
         async with aiohttp.ClientSession() as s:
             async with s.get(url) as r:
@@ -136,6 +136,12 @@ class QuotingEngine:
             "leverage": LEVERAGE,
         })
         log.info(f"Leverage: {r.get('leverage', '?')}x set for {self.symbol}")
+
+        # Enable Hedge Mode – required for separate LONG/SHORT positions and reduceOnly orders
+        r = await self._signed_post("/fapi/v1/positionSide/dual", {
+            "dualSidePosition": "true"
+        })
+        log.info(f"Hedge mode enabled: {r.get('msg', 'success')}")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -338,8 +344,9 @@ class QuotingEngine:
                 await self._cancel_algo_order(sl_ref.order_id)
                 set_sl(None)
 
+
     async def _place_tp_order(self, side: str, pos_side: str, tp_price: float, qty: float, entry_price: float = 0.0) -> bool:
-        """Place a take-profit LIMIT order (GTC) and verify it exists on Binance."""
+        """Place a take-profit LIMIT order (GTC) in hedge mode (no reduceOnly needed)."""
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
         params = {
             "symbol": self.symbol,
@@ -349,6 +356,7 @@ class QuotingEngine:
             "timeInForce": "GTC",
             "price": f"{tp_price:.6f}".rstrip('0').rstrip('.'),
             "quantity": f"{qty:.{decimals}f}",
+            # No reduceOnly – hedge mode uses positionSide for closing
         }
         try:
             r = await self._signed_post("/fapi/v1/order", params)
@@ -379,6 +387,9 @@ class QuotingEngine:
         except Exception as e:
             log.error(f"TP place error: {e}")
             return False
+
+
+
 
     async def _place_sl_order(self, side: str, pos_side: str, stop_price: float, qty: float, entry_price: float) -> bool:
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
