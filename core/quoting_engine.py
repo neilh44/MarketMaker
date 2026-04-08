@@ -278,6 +278,7 @@ class QuotingEngine:
             set_sl=lambda o: setattr(self, "_short_sl", o),
         )
 
+
     async def _sync_side_exits(
         self, pos_qty, entry, tp_side, sl_side, pos_side,
         tp_price_fn, sl_price_fn, tp_ref, sl_ref, set_tp, set_sl
@@ -300,11 +301,11 @@ class QuotingEngine:
                     self.realized_pnl += pnl
                     log.info(f"{pos_side} TP {tp_ref.order_id} filled – P&L: {pnl:+.4f} USDT | Total: {self.realized_pnl:+.4f}")
                     if sl_ref is not None:
-                        await self._cancel_order(sl_ref.order_id)
+                        await self._cancel_algo_order(sl_ref.order_id)   # ← FIXED
                         set_sl(None)
                     set_tp(None)
                 elif (abs(tp_ref.entry_price - entry) > 1e-8 or
-                      abs(tp_ref.qty - desired_qty) > self._step_size):
+                    abs(tp_ref.qty - desired_qty) > self._step_size):
                     log.info(f"{pos_side} entry/qty changed — replacing TP")
                     await self._cancel_order(tp_ref.order_id)
                     set_tp(None)
@@ -319,14 +320,14 @@ class QuotingEngine:
                 if (abs(sl_ref.entry_price - entry) > 1e-8 or
                     abs(sl_ref.qty - desired_qty) > self._step_size):
                     log.info(f"{pos_side} entry/qty changed — replacing SL")
-                    await self._cancel_order(sl_ref.order_id)
+                    await self._cancel_algo_order(sl_ref.order_id)       # ← FIXED
                     set_sl(None)
 
             if sl_ref is None and pos_qty > 0:
                 ok = await self._place_sl_order(sl_side, pos_side, desired_sl, desired_qty, entry)
                 if ok:
                     log.info(f"SL placed: {sl_side}/{pos_side} qty={desired_qty} stopAt={desired_sl} "
-                             f"(entry={entry} loss_cap={SL_BPS:.0f}bps)")
+                            f"(entry={entry} loss_cap={SL_BPS:.0f}bps)")
 
         else:
             # Position closed – reset inventory and clean up
@@ -341,12 +342,19 @@ class QuotingEngine:
                 set_tp(None)
             if sl_ref is not None:
                 log.info(f"{pos_side} position closed — cancelling leftover SL {sl_ref.order_id}")
-                await self._cancel_order(sl_ref.order_id)
+                await self._cancel_algo_order(sl_ref.order_id)           # ← FIXED
                 set_sl(None)
 
 
     async def _place_tp_order(self, side: str, pos_side: str, tp_price: float, qty: float, entry_price: float = 0.0) -> bool:
-        """Place a take-profit LIMIT order (GTC) in hedge mode (no reduceOnly needed)."""
+        # Guard: Do not place closing order if no position exists
+        if pos_side == "LONG" and self._current_long_qty <= 0:
+            log.debug(f"Skipping LONG TP — no LONG position exists")
+            return False
+        if pos_side == "SHORT" and self._current_short_qty <= 0:
+            log.debug(f"Skipping SHORT TP — no SHORT position exists")
+            return False
+
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
         params = {
             "symbol": self.symbol,
@@ -356,95 +364,85 @@ class QuotingEngine:
             "timeInForce": "GTC",
             "price": f"{tp_price:.6f}".rstrip('0').rstrip('.'),
             "quantity": f"{qty:.{decimals}f}",
-            # No reduceOnly – hedge mode uses positionSide for closing
+            # NO reduceOnly – Hedge Mode uses positionSide for closing
         }
         try:
+            log.debug(f"TP Order Params: {params}")            
             r = await self._signed_post("/fapi/v1/order", params)
             if "orderId" not in r:
                 log.warning(f"TP order rejected [{r.get('code')}]: {r.get('msg')}")
                 return False
 
             order_id = r["orderId"]
-
             confirmed = await self._verify_order_exists(order_id)
             if not confirmed:
                 log.warning(f"TP order {order_id} placed but NOT found on Binance — not marking as set")
                 return False
 
-            tp = TpOrder(
-                order_id=order_id,
-                position_side=pos_side,
-                entry_price=entry_price,
-                tp_price=tp_price,
-                qty=qty,
-            )
+            tp = TpOrder(order_id=order_id, position_side=pos_side, entry_price=entry_price, tp_price=tp_price, qty=qty)
             if pos_side == "LONG":
                 self._long_tp = tp
             else:
                 self._short_tp = tp
             return True
-
         except Exception as e:
             log.error(f"TP place error: {e}")
+            return False    # ← Correct indentation (4 spaces, same level as log.error)
+
+            
+    async def _place_sl_order(self, side: str, pos_side: str, stop_price: float, qty: float, entry_price: float) -> bool:
+        # Guard: Do not place closing order if no position exists
+        if pos_side == "LONG" and self._current_long_qty <= 0:
+            log.debug(f"Skipping LONG SL — no LONG position exists")
+            return False
+        if pos_side == "SHORT" and self._current_short_qty <= 0:
+            log.debug(f"Skipping SHORT SL — no SHORT position exists")
             return False
 
-
-    async def _place_sl_order(self, side: str, pos_side: str, stop_price: float, qty: float, entry_price: float) -> bool:
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
-        
-        # **CRITICAL FIX:** Use STOP (Stop-Limit) instead of STOP_MARKET.
-        # The 'price' field defines the worst acceptable fill price, eliminating slippage.
-        # We set the limit price slightly worse than the trigger to ensure a higher fill probability.
-        limit_price_offset = 5 / 10_000  # 5 bps offset
-        
-        if pos_side == "LONG":  # Closing a LONG -> SELL
-            # Trigger is at a lower price. Limit price should be even lower.
+        limit_price_offset = 5 / 10_000  # 5 bps
+
+        if pos_side == "LONG":  # Closing LONG → SELL
             limit_price = self._round_price(stop_price * (1 - limit_price_offset))
-        else:  # Closing a SHORT -> BUY
-            # Trigger is at a higher price. Limit price should be even higher.
+        else:  # Closing SHORT → BUY
             limit_price = self._round_price(stop_price * (1 + limit_price_offset))
-            
+
         params = {
             "symbol": self.symbol,
             "side": side,
             "positionSide": pos_side,
-            "type": "STOP",               # <- CHANGED from STOP_MARKET
-            "timeInForce": "GTC",
+            "algoType": "CONDITIONAL",
+            "type": "STOP",
             "quantity": f"{qty:.{decimals}f}",
-            "price": f"{limit_price:.6f}".rstrip('0').rstrip('.'),  # <- REQUIRED for STOP
-            "stopPrice": f"{stop_price:.6f}".rstrip('0').rstrip('.'), # Trigger price
-            "workingType": "CONTRACT_PRICE"
+            "price": f"{limit_price:.6f}".rstrip('0').rstrip('.'),
+            "triggerPrice": f"{stop_price:.6f}".rstrip('0').rstrip('.'),   # ✅ Correct parameter name
+            "workingType": "CONTRACT_PRICE",
+            "timeInForce": "GTC",
+            # NO reduceOnly
         }
-        
+
         try:
-            r = await self._signed_post("/fapi/v1/order", params)  # **NOTE:** Endpoint is now /fapi/v1/order
-            if "orderId" not in r:
+            r = await self._signed_post("/fapi/v1/algoOrder", params)
+            if "algoId" not in r:
                 code = r.get('code')
                 if code == -2021:
-                    log.debug(f"SL skipped — would immediately trigger (stop={stop_price}, entry={entry_price})")
+                    log.debug(f"SL skipped — would immediately trigger")
                     return False
-                log.warning(f"SL order rejected [{code}]: {r.get('msg')}")
+                log.warning(f"SL algo order rejected [{code}]: {r.get('msg')}")
                 return False
 
-            order_id = r["orderId"]
-            sl = SlOrder(
-                order_id=order_id,
-                position_side=pos_side,
-                entry_price=entry_price,
-                sl_price=stop_price,
-                qty=qty,
-            )
+            algo_id = r["algoId"]
+            sl = SlOrder(order_id=algo_id, position_side=pos_side, entry_price=entry_price, sl_price=stop_price, qty=qty)
             if pos_side == "LONG":
                 self._long_sl = sl
             else:
                 self._short_sl = sl
-            log.info(f"SL (STOP-LIMIT) placed: orderId={order_id} {side}/{pos_side} qty={qty} triggerAt={stop_price} limitAt={limit_price}")
+            log.info(f"SL (STOP-LIMIT) placed: algoId={algo_id} trigger={stop_price} limit={limit_price}")   # ✅ Fixed Unicode dash
             return True
-
         except Exception as e:
             log.error(f"SL place error: {e}")
             return False
-
+            
 
     async def _verify_algo_order_exists(self, algo_id: int, retries: int = 3, delay: float = 0.5) -> bool:
         """Confirm an algo order is live via GET /fapi/v1/openAlgoOrders."""
@@ -641,8 +639,11 @@ class QuotingEngine:
                     await self._cancel_order(o.order_id)
             for o in [self._long_sl, self._short_sl]:
                 if o:
-                    await self._cancel_order(o.order_id)
+                    await self._cancel_algo_order(o.order_id)   # ← FIXED
             self._long_tp = self._short_tp = self._long_sl = self._short_sl = None
+
+            
+    
 
     async def _cancel_order(self, order_id: int):
         """Cancel a regular order via /fapi/v1/order."""
@@ -654,6 +655,16 @@ class QuotingEngine:
         except Exception as e:
             log.debug(f"Cancel order {order_id} failed (may already be filled): {e}")
 
+    async def _verify_order_exists(self, order_id: int) -> bool:
+        try:
+            orders = await self._signed_get("/fapi/v1/openOrders", {"symbol": self.symbol})
+            if not isinstance(orders, list):
+                return False
+            return order_id in [o["orderId"] for o in orders]
+        except Exception as e:
+            log.debug(f"Order verify failed: {e}")
+            return False
+
     async def _cancel_algo_order(self, algo_id: int):
         """Cancel an algo order via DELETE /fapi/v1/algoOrder."""
         try:
@@ -663,6 +674,8 @@ class QuotingEngine:
             })
         except Exception as e:
             log.debug(f"Cancel algo order {algo_id} failed (may already be filled): {e}")
+
+
 
     # ── Binance signed request helpers ────────────────────────────────────────
 
