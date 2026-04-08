@@ -30,6 +30,9 @@ from core.feed_handler import FeedHandler
 from core.llm_advisor import LLMAdvisor
 from core.quoting_engine import QuotingEngine
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
 os.makedirs("logs", exist_ok=True)
