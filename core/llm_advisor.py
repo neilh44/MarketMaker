@@ -1,163 +1,203 @@
 """
 llm_advisor.py
 --------------
-Slow loop (default 20s) that calls the Groq API (OpenAI-compatible)
-with a market snapshot and receives structured QuoteParams back as JSON.
-
-Uses qwen/qwen3-32b via Groq's inference endpoint.
-The model is instructed to output ONLY JSON — no prose, no markdown.
+Polls LLM (Groq / qwen3-32b) every N seconds to obtain a market regime,
+dynamic trading parameters, and supervisory actions.
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import time
+from typing import Optional
 
 import aiohttp
 
-from core.shared_state import SharedState
+from core.shared_state import SharedState, ParamsSnapshot
 
 log = logging.getLogger("llm")
 
-GROQ_API = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "qwen/qwen3-32b"
-POLL_INTERVAL = 20      # seconds between LLM calls
-MAX_TOKENS = 256
-
-SYSTEM_PROMPT = """You are a market-making parameter advisor for a Binance Futures bot.
-You receive a JSON market snapshot and must respond with ONLY a JSON object — no prose,
-no markdown, no explanation, no <think> tags. Your output is parsed directly by code.
-
-Output schema (all fields required):
-{
-  "spread_bps": <float, 10–50, total spread in basis points>,
-  "skew": <float, -1.0 to 1.0, negative = lean short, positive = lean long>,
-  "paused": <bool, true if conditions are dangerous>,
-  "regime": <string, one of: "trending_up", "trending_down", "choppy", "low_vol", "news_spike">,
-  "max_position_usd": <float, 10–200, max notional per side>,
-  "reason": <string, max 80 chars, brief justification>
-}
-
-Decision rules:
-- Widen spread (>15bps) when volatility is high or exchange spread is already wide
-- Narrow spread (10 bps) during calm, low-vol sessions, never below 10bps
-- Skew negative when recent price_change_pct is strongly positive (you'll get picked off on longs)
-- Skew positive when price is falling and you want to accumulate longs cheap
-- Pause when: volatility >0.8, price_change_pct >2% in 1 min, or spread_bps >30
-- Never pause just because vol is moderate — that is normal market making conditions
-- Commission is 0.045% per side per fill. Round-trip cost = 0.09% = 9bps.
-- NEVER set spread_bps below 10. Minimum viable spread is 10bps.
-- Target spread 12-15bps in normal conditions to ensure profit after fees.
-- Only go to 10bps in very calm, low-vol sessions.
-"""
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL_NAME = "qwen/qwen3-32b"
 
 
 class LLMAdvisor:
-    def __init__(self, state: SharedState, poll_interval: int = POLL_INTERVAL):
+    def __init__(self, state: SharedState, interval: float = 10.0):
         self.state = state
-        self.poll_interval = poll_interval
+        self.interval = interval
         self._api_key = os.environ.get("GROQ_API_KEY", "")
         self._running = False
         self._call_count = 0
-        self._last_error: str | None = None
 
-    async def run(self):
+
+    async def _call_llm(self, market_snapshot) -> Optional[dict]:
+        """Send market context to Groq and return parsed JSON."""
         if not self._api_key:
-            log.error("GROQ_API_KEY not set — LLM advisor disabled")
-            return
+            log.error("GROQ_API_KEY not set")
+            return None
 
-        self._running = True
-        log.info(f"LLM advisor starting (Groq / {MODEL}), polling every {self.poll_interval}s")
+        # Gather current state
+        long_qty, short_qty, long_entry, short_entry = self.state.get_position_summary()
+        realized_pnl = self.state.realized_pnl
 
-        while self._running:
-            try:
-                await self._advise()
-            except Exception as e:
-                self._last_error = str(e)
-                log.warning(f"LLM call failed: {e}")
-            await asyncio.sleep(self.poll_interval)
+        mid = market_snapshot.mid
+        price_change_pct = getattr(market_snapshot, 'price_change_pct', 0.0)
+        volatility = getattr(market_snapshot, 'volatility', 0.0)
+        exchange_spread = getattr(market_snapshot, 'spread_bps', 0.0)
 
-    async def _advise(self):
-        market = self.state.get_market_snapshot()
-        pos = self.state.position
-        params = self.state.get_params_snapshot()
+        prompt = f"""
+You are a quantitative trading strategist controlling a market-making bot on STOUSDT perpetual futures (Hedge Mode).
+Current state:
+- Mid price: {mid:.6f}
+- 1m price change: {price_change_pct:.2f}%
+- Volatility (ATR): {volatility:.2f}%
+- Exchange spread: {exchange_spread:.1f} bps
+- LONG position: {long_qty:.0f} @ {long_entry:.6f}
+- SHORT position: {short_qty:.0f} @ {short_entry:.6f}
+- Realized PnL: {realized_pnl:.4f} USDT
 
-        if market.mid == 0:
-            log.debug("Skipping LLM call — no market data yet")
-            return
+You must output a JSON object with the following fields:
+- action: one of "CONTINUE", "PAUSE", "CLOSE_LONG", "CLOSE_SHORT", "FLATTEN"
+- spread_bps: target bid-ask spread in basis points (only used if CONTINUE)
+- skew: float between -1.0 and 1.0; negative favors LONG, positive favors SHORT
+- sl_bps: stop-loss distance in basis points from entry
+- tp_bps: take-profit distance in basis points from entry (overrides spread-based TP)
+- position_multiple: max inventory per side as multiple of base quote (e.g., 1.1)
+- reason: brief explanation of your decision
 
-        snapshot = {
-            "symbol": market.symbol,
-            "mid_price": round(market.mid, 6),
-            "exchange_spread_bps": round(market.spread_bps, 2),
-            "volatility_annualised": round(market.volatility, 4),
-            "price_change_pct_1m": round(market.price_change_pct, 4),
-            "volume_24h": round(market.volume_24h, 2),
-            "current_spread_bps": params.spread_bps,
-            "current_skew": params.skew,
-            "current_paused": params.paused,
-            "long_qty": pos.long_qty,
-            "short_qty": pos.short_qty,
-            "realised_pnl": round(pos.realised_pnl, 4),
-            "unrealised_pnl": round(pos.unrealised_pnl, 4),
-            "wins": pos.wins,
-            "losses": pos.losses,
-        }
+Example response:
+{{"action": "CONTINUE", "spread_bps": 30, "skew": -0.2, "sl_bps": 20, "tp_bps": 45, "position_multiple": 1.2, "reason": "Low volatility, slight long bias"}}
+"""
 
-        user_msg = f"Market snapshot:\n{json.dumps(snapshot, indent=2)}\n\nAdvise new parameters."
-
-        t0 = time.time()
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        body = {
-            "model": MODEL,
-            "max_tokens": MAX_TOKENS,
+        payload = {
+            "model": MODEL_NAME,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
+                {"role": "system", "content": "You are a precise trading strategist. Respond only with valid JSON."},
+                {"role": "user", "content": prompt},
             ],
-            "response_format": {"type": "json_object"},
-            "reasoning_effort": "none",  # disable Qwen3 <think> blocks — breaks JSON mode
+            "temperature": 0.2,
+            "max_tokens": 5000,  # Increased slightly to allow for reasoning + JSON
         }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GROQ_API, headers=headers, json=body) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise RuntimeError(f"Groq API {resp.status}: {text[:200]}")
-                data = await resp.json()
+        # Retry up to 2 times with increased timeout
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # Increased timeout: 45 seconds total
+                    timeout = aiohttp.ClientTimeout(total=45)
+                    async with session.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            log.error(f"Groq API error {resp.status}: {text[:200]}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2)
+                                continue
+                            return None
 
-        raw = data["choices"][0]["message"]["content"].strip()
+                        data = await resp.json()
+                        content = data["choices"][0]["message"]["content"]
 
-        advice = json.loads(raw)
-        latency_ms = int((time.time() - t0) * 1000)
-        self._call_count += 1
+                        if not content or content.strip() == "":
+                            log.error("LLM returned empty response")
+                            return None
 
-        log.info(
-            f"LLM #{self._call_count} ({latency_ms}ms) -> "
-            f"spread={advice['spread_bps']}bps skew={advice['skew']} "
-            f"paused={advice['paused']} regime={advice['regime']} | {advice['reason']}"
-        )
+                        # Strip <think>...</think> blocks (DeepSeek reasoning)
+                        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
-        await self.state.update_params(
-            spread_bps=float(advice["spread_bps"]),
-            skew=float(advice["skew"]),
-            paused=bool(advice["paused"]),
-            regime=str(advice["regime"]),
-            max_position_usd=float(advice.get("max_position_usd", 50.0)),
-            reason=str(advice.get("reason", "")),
-        )
+                        # Extract JSON from response
+                        if "```json" in content:
+                            content = content.split("```json")[1].split("```")[0].strip()
+                        elif "```" in content:
+                            content = content.split("```")[1].split("```")[0].strip()
 
-    def stop(self):
-        self._running = False
+                        try:
+                            return json.loads(content)
+                        except json.JSONDecodeError as e:
+                            log.error(f"LLM JSON decode failed: {e} | Raw: {content[:200]}")
+                            return None
+
+            except asyncio.TimeoutError:
+                log.warning(f"LLM call timed out (attempt {attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                log.error("LLM call timed out after all retries")
+                return None
+            except Exception as e:
+                log.error(f"LLM call failed (attempt {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+
+        return None
+
+    async def _update_params_from_llm(self):
+        """Fetch LLM decision and update shared state."""
+        market = self.state.get_market_snapshot()
+        if market.mid == 0:
+            log.debug("Skipping LLM call – no market data")
+            return
+
+        llm_response = await self._call_llm(market)
+        if llm_response is None:
+            # LLM failed – keep existing parameters unchanged
+            log.debug("LLM call failed, retaining previous parameters")
+            return
+
+        try:
+            # Parse with defaults for safety
+            action = str(llm_response.get("action", "CONTINUE")).upper()
+            if action not in ("CONTINUE", "PAUSE", "CLOSE_LONG", "CLOSE_SHORT", "FLATTEN"):
+                log.warning(f"Invalid action '{action}', defaulting to CONTINUE")
+                action = "CONTINUE"
+
+            new_params = ParamsSnapshot(
+                spread_bps=float(llm_response.get("spread_bps", 25.0)),
+                skew=float(llm_response.get("skew", 0.0)),
+                paused=(action == "PAUSE"),
+                regime=llm_response.get("regime", "unknown"),
+                max_position_usd=self.state.params.max_position_usd,
+                action=action,
+                sl_bps=float(llm_response.get("sl_bps", 25.0)),
+                tp_bps=float(llm_response.get("tp_bps", 40.0)),
+                position_multiple=float(llm_response.get("position_multiple", 1.1)),
+            )
+            self.state.update_params(**new_params.__dict__)
+            self._call_count += 1
+
+            log.info(
+                f"LLM #{self._call_count} -> "
+                f"action={action} spread={new_params.spread_bps:.1f}bps "
+                f"skew={new_params.skew:+.2f} sl={new_params.sl_bps:.1f}bps "
+                f"tp={new_params.tp_bps:.1f}bps mult={new_params.position_multiple:.2f} | "
+                f"{llm_response.get('reason', '')}"
+            )
+
+        except (KeyError, ValueError, TypeError) as e:
+            log.error(f"Failed to parse LLM response: {e} | Raw: {llm_response}")
+
+    async def run(self):
+        """Main polling loop."""
+        self._running = True
+        log.info(f"LLM advisor starting (Groq / {MODEL_NAME}), polling every {self.interval}s")
+
+        while self._running:
+            await self._update_params_from_llm()
+            await asyncio.sleep(self.interval)
 
     @property
     def stats(self) -> dict:
         return {
             "call_count": self._call_count,
-            "last_error": self._last_error,
-            "poll_interval": self.poll_interval,
         }
+
+    def stop(self):
+        self._running = False

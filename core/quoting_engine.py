@@ -5,18 +5,14 @@ Fast loop: reads latest market tick + LLM params -> posts BID and ASK
 as LIMIT orders on Binance Futures (Hedge Mode).
 
 Flow per tick:
-  1. Check paused flag -- cancel all and sleep if true
-  2. Compute target bid/ask from mid +/- half-spread +/- skew adjustment
-  3. If quoted prices haven't moved more than min_tick -> skip (avoid churn)
-  4. Cancel existing ENTRY orders -> place new BID + ASK
-  5. Sync positions every 2s -> place/replace TP + SL on each open side
-     - TP: LIMIT order at entry + (spread + 9bps commission)
-     - SL: STOP algo order at entry +/- 15bps (3% ROI loss at 10x)
-       NOTE: SL uses /fapi/v1/order/algo/stop (Algo Order API) because
-             STOP_MARKET is not supported on /fapi/v1/order (-4120).
-             Algo orders use algoId (not orderId) and have separate
-             open-order and cancel endpoints.
-     - When either fills, cancel the other on same side
+  1. Check LLM action (PAUSE, CLOSE_*, FLATTEN) – execute and skip quoting if needed.
+  2. Compute target bid/ask from mid +/- half-spread +/- skew adjustment (LLM-provided).
+  3. If quoted prices haven't moved more than min_tick -> skip (avoid churn).
+  4. Cancel existing ENTRY orders -> place new BID + ASK.
+  5. Sync positions every 10s -> place/replace TP + SL on each open side.
+     - TP: LIMIT order at entry + (tp_bps / 10_000)   [LLM provides tp_bps]
+     - SL: STOP algo order (Stop-Limit) at entry +/- sl_bps   [LLM provides sl_bps]
+     - When either fills, cancel the other on same side.
 """
 
 import asyncio
@@ -36,17 +32,17 @@ log = logging.getLogger("engine")
 
 BINANCE_REST = "https://fapi.binance.com"
 MIN_PRICE_MOVE_BPS = 0.9      # don't requote unless price moved this much
-MIN_SPREAD_BPS = 25.0         # minimum spread to ensure positive EV
-MAX_POSITION_MULTIPLE = 1.1   # max position per side = 1.5 × base quote quantity
-LEVERAGE = 10                 # reduced from 20 for better margin safety
 ORDER_TYPE = "LIMIT"
 TIME_IN_FORCE = "GTC"
 TP_CHECK_INTERVAL = 10.0      # seconds between position sync cycles
-COMMISSION_BPS = 9.0          # round-trip commission (0.045% x 2 sides) – conservative estimate
-SL_ROI_PCT = 0.03             # stop-loss at 3% ROI loss
-SL_BPS = SL_ROI_PCT / LEVERAGE * 10_000  # 3% / 10x leverage = 30bps? Wait recalc: 0.03/10*10000=30bps? That's wrong. Actually we want 15bps at 20x, with 10x it's 30bps. But user wanted 15bps SL? Let's keep consistent: earlier we had 0.03 at 20x = 15bps. To keep same 15bps SL at 10x, we need SL_ROI_PCT = 0.015. We'll set it to 0.015 for 15bps SL.
-# Actually let's use SL_BPS directly to avoid confusion:
-SL_BPS = 15.0                 # Stop loss distance in basis points
+COMMISSION_BPS = 9.0          # round-trip commission (conservative estimate)
+LEVERAGE = 10                 # fixed leverage for margin calculations
+
+# Fallback values (used if LLM fails to provide)
+FALLBACK_SPREAD_BPS = 25.0
+FALLBACK_SL_BPS = 25.0
+FALLBACK_TP_BPS = 40.0
+FALLBACK_POSITION_MULTIPLE = 1.1
 
 
 @dataclass
@@ -69,10 +65,10 @@ class TpOrder:
 
 @dataclass
 class SlOrder:
-    order_id: int       # algoId returned by /fapi/v1/order/algo/stop
+    order_id: int       # algoId returned by /fapi/v1/algoOrder
     position_side: str
     entry_price: float
-    sl_price: float     # stopPrice sent to Binance
+    sl_price: float     # triggerPrice sent to Binance
     qty: float
 
 
@@ -92,7 +88,7 @@ class QuotingEngine:
         self._step_size: float = 0.001  # set by _fetch_symbol_info on startup
         self._consecutive_failures: int = 0
 
-        # Take-profit and stop-loss tracking — one per side at most
+        # Take-profit and stop-loss tracking
         self._long_tp: TpOrder | None = None
         self._short_tp: TpOrder | None = None
         self._long_sl: SlOrder | None = None
@@ -107,7 +103,7 @@ class QuotingEngine:
         self._current_long_qty: float = 0.0
         self._current_short_qty: float = 0.0
 
-        # Realized P&L tracking
+        # Realized P&L tracking (accumulated in _sync_side_exits)
         self.realized_pnl: float = 0.0
 
         # Margin failure cooldown
@@ -130,14 +126,14 @@ class QuotingEngine:
                         log.info(f"Symbol {self.symbol}: stepSize={self._step_size}")
                 break
 
-        # Set leverage (applies to both LONG and SHORT in hedge mode)
+        # Set leverage
         r = await self._signed_post("/fapi/v1/leverage", {
             "symbol": self.symbol,
             "leverage": LEVERAGE,
         })
         log.info(f"Leverage: {r.get('leverage', '?')}x set for {self.symbol}")
 
-        # Enable Hedge Mode – required for separate LONG/SHORT positions and reduceOnly orders
+        # Enable Hedge Mode
         r = await self._signed_post("/fapi/v1/positionSide/dual", {
             "dualSidePosition": "true"
         })
@@ -158,29 +154,88 @@ class QuotingEngine:
                 await asyncio.sleep(0.1)
                 continue
 
-            if params.paused:
+            # --- LLM Supervisory Actions ---
+            action = getattr(params, 'action', 'CONTINUE')
+            if action == "PAUSE":
                 if self._bid_order or self._ask_order:
-                    log.info("LLM paused -- cancelling entry quotes (TP/SL orders kept)")
+                    log.info("LLM commanded PAUSE – cancelling entry quotes")
                     await self._cancel_all(include_tp=False)
                 await asyncio.sleep(1.0)
                 continue
 
+            if action == "CLOSE_LONG":
+                await self._close_side("LONG")
+                await asyncio.sleep(1.0)
+                continue
+
+            if action == "CLOSE_SHORT":
+                await self._close_side("SHORT")
+                await asyncio.sleep(1.0)
+                continue
+
+            if action == "FLATTEN":
+                await self._close_side("LONG")
+                await self._close_side("SHORT")
+                await asyncio.sleep(1.0)
+                continue
+
+            # --- Normal Market Making ---
             await self._requote(market.mid, params)
 
             # Check positions and place TPs/SLs every TP_CHECK_INTERVAL seconds
             now = time.time()
             if now - self._last_tp_check >= TP_CHECK_INTERVAL:
                 self._last_tp_check = now
-                await self._sync_exits(params.spread_bps)
+                await self._sync_exits(params)
 
             self._tick_count += 1
             await asyncio.sleep(0.0)  # yield to event loop
+
+    async def _close_side(self, side: str):
+        """Market-close all positions on the given side."""
+        pos_qty = self._current_long_qty if side == "LONG" else self._current_short_qty
+        if pos_qty <= 0:
+            log.info(f"No {side} position to close")
+            return
+
+        # Cancel associated TP/SL orders
+        if side == "LONG":
+            if self._long_tp:
+                await self._cancel_order(self._long_tp.order_id)
+                self._long_tp = None
+            if self._long_sl:
+                await self._cancel_algo_order(self._long_sl.order_id)
+                self._long_sl = None
+        else:
+            if self._short_tp:
+                await self._cancel_order(self._short_tp.order_id)
+                self._short_tp = None
+            if self._short_sl:
+                await self._cancel_algo_order(self._short_sl.order_id)
+                self._short_sl = None
+
+        order_side = "SELL" if side == "LONG" else "BUY"
+        params = {
+            "symbol": self.symbol,
+            "side": order_side,
+            "positionSide": side,
+            "type": "MARKET",
+            "quantity": str(int(pos_qty)),
+        }
+        try:
+            r = await self._signed_post("/fapi/v1/order", params)
+            log.info(f"LLM commanded: Closed {side} side ({pos_qty} qty). Response: {r}")
+            if side == "LONG":
+                self._current_long_qty = 0.0
+            else:
+                self._current_short_qty = 0.0
+        except Exception as e:
+            log.error(f"Failed to close {side}: {e}")
 
     # ── Quote calculation ─────────────────────────────────────────────────────
 
     def _compute_quotes(self, mid: float, spread_bps: float, skew: float) -> tuple[float, float]:
         half = (spread_bps / 10_000) / 2 * mid
-        # Negative skew = tighter bid (favor LONG), wider ask (avoid SHORT)
         bid = mid - half * (1 + skew)
         ask = mid + half * (1 - skew)
         if mid >= 1:
@@ -204,20 +259,11 @@ class QuotingEngine:
 
     # ── Exit management (TP + SL) ─────────────────────────────────────────────
 
-    async def _sync_exits(self, spread_bps: float):
+    async def _sync_exits(self, params):
         """
-        Every TP_CHECK_INTERVAL seconds:
-        - Fetch positions from Binance
-        - For each open side: ensure TP (LIMIT) and SL (algo STOP) are live
-        - Replace TP/SL if avg entry or qty has changed
-        - When position gone: cancel any remaining exit order on that side
-        - If TP filled -> cancel SL. If SL filled -> cancel TP.
+        Ensure TP and SL orders are live for open positions, using LLM-provided
+        tp_bps and sl_bps (with fallbacks).
         """
-        # Enforce minimum spread for positive EV
-        effective_spread = max(spread_bps, MIN_SPREAD_BPS)
-        if effective_spread != spread_bps:
-            log.info(f"Spread clamped to {effective_spread:.1f}bps (LLM gave {spread_bps:.1f})")
-
         positions = await self._fetch_positions()
         if positions is None:
             return
@@ -242,7 +288,6 @@ class QuotingEngine:
                 short_qty = qty
                 short_entry = entry
 
-        # Periodic sync of inventory (real-time updates happen on fill/close)
         self._current_long_qty = long_qty
         self._current_short_qty = short_qty
 
@@ -255,8 +300,14 @@ class QuotingEngine:
             long_entry=long_entry, short_entry=short_entry,
         )
 
-        tp_offset = (effective_spread + COMMISSION_BPS) / 10_000
-        sl_offset = SL_BPS / 10_000
+        # Use LLM values if available, otherwise fallback
+        tp_bps = getattr(params, 'tp_bps', None)
+        if tp_bps is None:
+            tp_bps = getattr(params, 'spread_bps', FALLBACK_SPREAD_BPS) + COMMISSION_BPS
+        sl_bps = getattr(params, 'sl_bps', FALLBACK_SL_BPS)
+
+        tp_offset = tp_bps / 10_000
+        sl_offset = sl_bps / 10_000
 
         await self._sync_side_exits(
             pos_qty=long_qty, entry=long_entry,
@@ -278,7 +329,6 @@ class QuotingEngine:
             set_sl=lambda o: setattr(self, "_short_sl", o),
         )
 
-
     async def _sync_side_exits(
         self, pos_qty, entry, tp_side, sl_side, pos_side,
         tp_price_fn, sl_price_fn, tp_ref, sl_ref, set_tp, set_sl
@@ -292,20 +342,14 @@ class QuotingEngine:
             if tp_ref is not None:
                 confirmed = await self._verify_order_exists(tp_ref.order_id)
                 if not confirmed:
-                    # TP filled – calculate P&L
-                    pnl = 0.0
-                    if pos_side == "LONG":
-                        pnl = (tp_ref.tp_price - entry) * pos_qty
-                    else:
-                        pnl = (entry - tp_ref.tp_price) * pos_qty
+                    pnl = (tp_ref.tp_price - entry) * pos_qty if pos_side == "LONG" else (entry - tp_ref.tp_price) * pos_qty
                     self.realized_pnl += pnl
                     log.info(f"{pos_side} TP {tp_ref.order_id} filled – P&L: {pnl:+.4f} USDT | Total: {self.realized_pnl:+.4f}")
                     if sl_ref is not None:
-                        await self._cancel_algo_order(sl_ref.order_id)   # ← FIXED
+                        await self._cancel_algo_order(sl_ref.order_id)
                         set_sl(None)
                     set_tp(None)
-                elif (abs(tp_ref.entry_price - entry) > 1e-8 or
-                    abs(tp_ref.qty - desired_qty) > self._step_size):
+                elif (abs(tp_ref.entry_price - entry) > 1e-8 or abs(tp_ref.qty - desired_qty) > self._step_size):
                     log.info(f"{pos_side} entry/qty changed — replacing TP")
                     await self._cancel_order(tp_ref.order_id)
                     set_tp(None)
@@ -317,20 +361,16 @@ class QuotingEngine:
 
             # --- SL ---
             if sl_ref is not None:
-                if (abs(sl_ref.entry_price - entry) > 1e-8 or
-                    abs(sl_ref.qty - desired_qty) > self._step_size):
+                if (abs(sl_ref.entry_price - entry) > 1e-8 or abs(sl_ref.qty - desired_qty) > self._step_size):
                     log.info(f"{pos_side} entry/qty changed — replacing SL")
-                    await self._cancel_algo_order(sl_ref.order_id)       # ← FIXED
+                    await self._cancel_algo_order(sl_ref.order_id)
                     set_sl(None)
 
             if sl_ref is None and pos_qty > 0:
                 ok = await self._place_sl_order(sl_side, pos_side, desired_sl, desired_qty, entry)
                 if ok:
-                    log.info(f"SL placed: {sl_side}/{pos_side} qty={desired_qty} stopAt={desired_sl} "
-                            f"(entry={entry} loss_cap={SL_BPS:.0f}bps)")
-
+                    log.info(f"SL placed: {sl_side}/{pos_side} qty={desired_qty} stopAt={desired_sl} (entry={entry})")
         else:
-            # Position closed – reset inventory and clean up
             if pos_side == "LONG":
                 self._current_long_qty = 0.0
             else:
@@ -342,17 +382,15 @@ class QuotingEngine:
                 set_tp(None)
             if sl_ref is not None:
                 log.info(f"{pos_side} position closed — cancelling leftover SL {sl_ref.order_id}")
-                await self._cancel_algo_order(sl_ref.order_id)           # ← FIXED
+                await self._cancel_algo_order(sl_ref.order_id)
                 set_sl(None)
 
+    # ── Order placement (TP, SL) ──────────────────────────────────────────────
 
     async def _place_tp_order(self, side: str, pos_side: str, tp_price: float, qty: float, entry_price: float = 0.0) -> bool:
-        # Guard: Do not place closing order if no position exists
         if pos_side == "LONG" and self._current_long_qty <= 0:
-            log.debug(f"Skipping LONG TP — no LONG position exists")
             return False
         if pos_side == "SHORT" and self._current_short_qty <= 0:
-            log.debug(f"Skipping SHORT TP — no SHORT position exists")
             return False
 
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
@@ -364,10 +402,8 @@ class QuotingEngine:
             "timeInForce": "GTC",
             "price": f"{tp_price:.6f}".rstrip('0').rstrip('.'),
             "quantity": f"{qty:.{decimals}f}",
-            # NO reduceOnly – Hedge Mode uses positionSide for closing
         }
         try:
-            log.debug(f"TP Order Params: {params}")            
             r = await self._signed_post("/fapi/v1/order", params)
             if "orderId" not in r:
                 log.warning(f"TP order rejected [{r.get('code')}]: {r.get('msg')}")
@@ -387,24 +423,20 @@ class QuotingEngine:
             return True
         except Exception as e:
             log.error(f"TP place error: {e}")
-            return False    # ← Correct indentation (4 spaces, same level as log.error)
+            return False
 
-            
     async def _place_sl_order(self, side: str, pos_side: str, stop_price: float, qty: float, entry_price: float) -> bool:
-        # Guard: Do not place closing order if no position exists
         if pos_side == "LONG" and self._current_long_qty <= 0:
-            log.debug(f"Skipping LONG SL — no LONG position exists")
             return False
         if pos_side == "SHORT" and self._current_short_qty <= 0:
-            log.debug(f"Skipping SHORT SL — no SHORT position exists")
             return False
 
         decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
-        limit_price_offset = 5 / 10_000  # 5 bps
+        limit_price_offset = 5 / 10_000  # 5 bps buffer
 
-        if pos_side == "LONG":  # Closing LONG → SELL
+        if pos_side == "LONG":
             limit_price = self._round_price(stop_price * (1 - limit_price_offset))
-        else:  # Closing SHORT → BUY
+        else:
             limit_price = self._round_price(stop_price * (1 + limit_price_offset))
 
         params = {
@@ -415,12 +447,10 @@ class QuotingEngine:
             "type": "STOP",
             "quantity": f"{qty:.{decimals}f}",
             "price": f"{limit_price:.6f}".rstrip('0').rstrip('.'),
-            "triggerPrice": f"{stop_price:.6f}".rstrip('0').rstrip('.'),   # ✅ Correct parameter name
+            "triggerPrice": f"{stop_price:.6f}".rstrip('0').rstrip('.'),
             "workingType": "CONTRACT_PRICE",
             "timeInForce": "GTC",
-            # NO reduceOnly
         }
-
         try:
             r = await self._signed_post("/fapi/v1/algoOrder", params)
             if "algoId" not in r:
@@ -437,30 +467,177 @@ class QuotingEngine:
                 self._long_sl = sl
             else:
                 self._short_sl = sl
-            log.info(f"SL (STOP-LIMIT) placed: algoId={algo_id} trigger={stop_price} limit={limit_price}")   # ✅ Fixed Unicode dash
+            log.info(f"SL (STOP-LIMIT) placed: algoId={algo_id} trigger={stop_price} limit={limit_price}")
             return True
         except Exception as e:
             log.error(f"SL place error: {e}")
             return False
-            
 
-    async def _verify_algo_order_exists(self, algo_id: int, retries: int = 3, delay: float = 0.5) -> bool:
-        """Confirm an algo order is live via GET /fapi/v1/openAlgoOrders."""
-        for attempt in range(retries):
-            await asyncio.sleep(delay)
-            try:
-                r = await self._signed_get("/fapi/v1/openAlgoOrders", {"symbol": self.symbol})
-                orders = r.get("orders", []) if isinstance(r, dict) else []
-                ids = [o["algoId"] for o in orders]
-                if algo_id in ids:
-                    return True
-                log.debug(f"Algo order {algo_id} not found yet (attempt {attempt+1}/{retries})")
-            except Exception as e:
-                log.debug(f"Algo order verify failed (attempt {attempt+1}): {e}")
-        return False
+    # ── Order management (entry quotes) ───────────────────────────────────────
+
+    async def _requote(self, mid: float, params):
+        now = time.time()
+        if now - self._last_quote_time < self._min_quote_interval:
+            return
+        self._last_quote_time = now
+
+        if self._margin_failure_count >= 3 and (now - self._last_margin_failure_time) < 60:
+            self._min_quote_interval = 15.0
+        else:
+            self._min_quote_interval = 5.0
+
+        if not await self._can_afford_new_quote(mid):
+            log.debug("Skipping quote – insufficient free margin")
+            return
+
+        spread_bps = getattr(params, 'spread_bps', FALLBACK_SPREAD_BPS)
+        skew = getattr(params, 'skew', 0.0)
+
+        bid_price, ask_price = self._compute_quotes(mid, spread_bps, skew)
+        if not self._has_moved(bid_price, ask_price, mid):
+            return
+
+        qty = self._compute_qty(mid, getattr(params, 'max_position_usd', 50.0))
+        if qty <= 0:
+            return
+
+        await self._cancel_all()
+        bid_ok = await self._place_order("BUY", "LONG", bid_price, qty)
+        ask_ok = await self._place_order("SELL", "SHORT", ask_price, qty)
+
+        if bid_ok and ask_ok:
+            self._consecutive_failures = 0
+            self._last_bid = bid_price
+            self._last_ask = ask_price
+            log.debug(f"Quoted BID={bid_price} ASK={ask_price} spread={(ask_price-bid_price)/mid*10000:.1f}bps qty={qty}")
+        else:
+            self._consecutive_failures += 1
+            backoff = min(2 ** self._consecutive_failures, 60)
+            log.warning(f"Order placement failed {self._consecutive_failures}x — backing off {backoff}s")
+            await asyncio.sleep(backoff)
+
+    def _compute_qty(self, price: float, max_usd: float) -> float:
+        raw = self.qty_usd / price
+        steps = int(raw / self._step_size)
+        qty = steps * self._step_size
+        max_qty = max_usd / price
+        return min(qty, max_qty)
+
+    async def _place_order(self, side: str, pos_side: str, price: float, qty: float) -> bool:
+        params = self.state.get_params_snapshot()
+        position_multiple = getattr(params, 'position_multiple', FALLBACK_POSITION_MULTIPLE)
+
+        if price > 0:
+            base_qty = self.qty_usd / price
+            max_allowed = base_qty * position_multiple
+            if pos_side == "LONG" and self._current_long_qty >= max_allowed:
+                log.debug(f"Inventory cap: LONG {self._current_long_qty:.0f} >= {max_allowed:.0f}, skipping BUY")
+                return False
+            if pos_side == "SHORT" and self._current_short_qty >= max_allowed:
+                log.debug(f"Inventory cap: SHORT {self._current_short_qty:.0f} >= {max_allowed:.0f}, skipping SELL")
+                return False
+
+        if not await self._check_margin_sufficient(price, qty):
+            self._margin_failure_count += 1
+            self._last_margin_failure_time = time.time()
+            return False
+
+        decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
+        order_params = {
+            "symbol": self.symbol,
+            "side": side,
+            "positionSide": pos_side,
+            "type": ORDER_TYPE,
+            "timeInForce": TIME_IN_FORCE,
+            "price": f"{price:.6f}".rstrip('0').rstrip('.'),
+            "quantity": f"{qty:.{decimals}f}",
+        }
+        try:
+            r = await self._signed_post("/fapi/v1/order", order_params)
+            if "orderId" in r:
+                if pos_side == "LONG":
+                    self._current_long_qty += qty
+                else:
+                    self._current_short_qty += qty
+
+                order = ActiveOrder(order_id=r["orderId"], side=side, price=price, qty=qty, position_side=pos_side)
+                if side == "BUY":
+                    self._bid_order = order
+                else:
+                    self._ask_order = order
+                return True
+            else:
+                log.warning(f"Order rejected [{r.get('code')}]: {r.get('msg')}")
+                return False
+        except Exception as e:
+            log.error(f"Place order error: {e}")
+            return False
+
+    async def _cancel_all(self, include_tp: bool = False):
+        for order in [self._bid_order, self._ask_order]:
+            if order:
+                await self._cancel_order(order.order_id)
+        self._bid_order = None
+        self._ask_order = None
+
+        if include_tp:
+            for o in [self._long_tp, self._short_tp]:
+                if o:
+                    await self._cancel_order(o.order_id)
+            for o in [self._long_sl, self._short_sl]:
+                if o:
+                    await self._cancel_algo_order(o.order_id)
+            self._long_tp = self._short_tp = self._long_sl = self._short_sl = None
+
+    # ── Utility methods ───────────────────────────────────────────────────────
+
+    async def _verify_order_exists(self, order_id: int) -> bool:
+        try:
+            orders = await self._signed_get("/fapi/v1/openOrders", {"symbol": self.symbol})
+            if not isinstance(orders, list):
+                return False
+            return order_id in [o["orderId"] for o in orders]
+        except Exception as e:
+            log.debug(f"Order verify failed: {e}")
+            return False
+
+    async def _cancel_order(self, order_id: int):
+        try:
+            await self._signed_delete("/fapi/v1/order", {"symbol": self.symbol, "orderId": order_id})
+        except Exception as e:
+            log.debug(f"Cancel order {order_id} failed: {e}")
+
+    async def _cancel_algo_order(self, algo_id: int):
+        try:
+            await self._signed_delete("/fapi/v1/algoOrder", {"symbol": self.symbol, "algoId": algo_id})
+        except Exception as e:
+            log.debug(f"Cancel algo order {algo_id} failed: {e}")
+
+    async def _check_margin_sufficient(self, price: float, qty: float) -> bool:
+        try:
+            account = await self._signed_get("/fapi/v2/account", {})
+            if not account:
+                return True
+            available = float(account.get("availableBalance", 0))
+            required = (price * qty) / LEVERAGE
+            return available >= required * 1.05
+        except Exception as e:
+            log.debug(f"Margin check failed: {e}")
+            return True
+
+    async def _can_afford_new_quote(self, mid: float) -> bool:
+        try:
+            account = await self._signed_get("/fapi/v2/account", {})
+            available = float(account.get("availableBalance", 0))
+            params = self.state.get_params_snapshot()
+            qty = self._compute_qty(mid, getattr(params, 'max_position_usd', 50.0))
+            new_margin = (mid * qty * 2) / LEVERAGE
+            return (available - new_margin) >= 2.0
+        except Exception as e:
+            log.debug(f"Global margin check failed: {e}")
+            return True
 
     async def _fetch_positions(self) -> list | None:
-        """Fetch open positions from Binance Futures."""
         try:
             r = await self._signed_get("/fapi/v2/positionRisk", {"symbol": self.symbol})
             return r if isinstance(r, list) else None
@@ -484,209 +661,12 @@ class QuotingEngine:
         steps = int(qty / self._step_size)
         return steps * self._step_size
 
-    async def _check_margin_sufficient(self, price: float, qty: float) -> bool:
-        """Check if sufficient margin exists before placing order."""
-        try:
-            account = await self._signed_get("/fapi/v2/account", {})
-            if not account:
-                return True  # Proceed if can't check
-
-            available_balance = float(account.get("availableBalance", 0))
-            position_value = price * qty
-            required_margin = position_value / LEVERAGE
-
-            return available_balance >= required_margin * 1.05  # 5% buffer
-        except Exception as e:
-            log.debug(f"Margin check failed: {e}")
-            return True  # Proceed if check fails
-
-    async def _can_afford_new_quote(self, mid: float) -> bool:
-        """Global margin check before attempting two-sided quote."""
-        try:
-            account = await self._signed_get("/fapi/v2/account", {})
-            available = float(account.get("availableBalance", 0))
-            # Estimate new order margin (both sides)
-            qty = self._compute_qty(mid, self.state.params.max_position_usd)
-            new_margin = (mid * qty * 2) / LEVERAGE
-            min_free_margin = 2.0  # require at least $2 free after placing orders
-            return (available - new_margin) >= min_free_margin
-        except Exception as e:
-            log.debug(f"Global margin check failed: {e}")
-            return True
-
-    # ── Order management ──────────────────────────────────────────────────────
-
-    async def _requote(self, mid: float, params):
-        # Rate limit quotes
-        now = time.time()
-        if now - self._last_quote_time < self._min_quote_interval:
-            return
-        self._last_quote_time = now
-
-        # Adjust quote interval if recent margin failures
-        if self._margin_failure_count >= 3 and (now - self._last_margin_failure_time) < 60:
-            self._min_quote_interval = 15.0
-        else:
-            self._min_quote_interval = 5.0
-
-        # Global margin check
-        if not await self._can_afford_new_quote(mid):
-            log.debug("Skipping quote – insufficient free margin for two-sided order")
-            return
-
-        bid_price, ask_price = self._compute_quotes(mid, params.spread_bps, params.skew)
-
-        if not self._has_moved(bid_price, ask_price, mid):
-            return
-
-        qty = self._compute_qty(mid, params.max_position_usd)
-        if qty <= 0:
-            return
-
-        await self._cancel_all()
-        bid_ok = await self._place_order("BUY", "LONG", bid_price, qty)
-        ask_ok = await self._place_order("SELL", "SHORT", ask_price, qty)
-
-        if bid_ok and ask_ok:
-            self._consecutive_failures = 0
-            self._last_bid = bid_price
-            self._last_ask = ask_price
-            log.debug(
-                f"Quoted BID={bid_price} ASK={ask_price} "
-                f"spread={(ask_price-bid_price)/mid*10000:.1f}bps qty={qty}"
-            )
-        else:
-            self._consecutive_failures += 1
-            backoff = min(2 ** self._consecutive_failures, 60)
-            log.warning(f"Order placement failed {self._consecutive_failures}x — backing off {backoff}s")
-            await asyncio.sleep(backoff)
-
-    def _compute_qty(self, price: float, max_usd: float) -> float:
-        raw = self.qty_usd / price
-        steps = int(raw / self._step_size)
-        qty = steps * self._step_size
-        max_qty = max_usd / price
-        return min(qty, max_qty)
-
-    async def _place_order(self, side: str, pos_side: str, price: float, qty: float) -> bool:
-        # Inventory Cap Check
-        if price > 0:
-            base_qty = self.qty_usd / price
-            max_allowed = base_qty * MAX_POSITION_MULTIPLE
-
-            if pos_side == "LONG" and self._current_long_qty >= max_allowed:
-                log.debug(f"Inventory cap: LONG {self._current_long_qty:.0f} >= {max_allowed:.0f}, skipping BUY")
-                return False
-            if pos_side == "SHORT" and self._current_short_qty >= max_allowed:
-                log.debug(f"Inventory cap: SHORT {self._current_short_qty:.0f} >= {max_allowed:.0f}, skipping SELL")
-                return False
-
-        # Margin check
-        if not await self._check_margin_sufficient(price, qty):
-            self._margin_failure_count += 1
-            self._last_margin_failure_time = time.time()
-            return False
-
-        decimals = len(str(self._step_size).rstrip('0').split('.')[-1])
-        params = {
-            "symbol": self.symbol,
-            "side": side,
-            "positionSide": pos_side,
-            "type": ORDER_TYPE,
-            "timeInForce": TIME_IN_FORCE,
-            "price": f"{price:.6f}".rstrip('0').rstrip('.'),
-            "quantity": f"{qty:.{decimals}f}",
-        }
-        try:
-            r = await self._signed_post("/fapi/v1/order", params)
-            if "orderId" in r:
-                # Immediate inventory update
-                if pos_side == "LONG":
-                    self._current_long_qty += qty
-                else:
-                    self._current_short_qty += qty
-
-                order = ActiveOrder(
-                    order_id=r["orderId"],
-                    side=side,
-                    price=price,
-                    qty=qty,
-                    position_side=pos_side,
-                )
-                if side == "BUY":
-                    self._bid_order = order
-                else:
-                    self._ask_order = order
-                return True
-            else:
-                log.warning(f"Order rejected [{r.get('code')}]: {r.get('msg')}")
-                return False
-        except Exception as e:
-            log.error(f"Place order error: {e}")
-            return False
-
-    async def _cancel_all(self, include_tp: bool = False):
-        """Cancel entry quotes. If include_tp=True, also cancel all TP and SL orders."""
-        for order in [self._bid_order, self._ask_order]:
-            if order:
-                await self._cancel_order(order.order_id)
-        self._bid_order = None
-        self._ask_order = None
-
-        if include_tp:
-            for o in [self._long_tp, self._short_tp]:
-                if o:
-                    await self._cancel_order(o.order_id)
-            for o in [self._long_sl, self._short_sl]:
-                if o:
-                    await self._cancel_algo_order(o.order_id)   # ← FIXED
-            self._long_tp = self._short_tp = self._long_sl = self._short_sl = None
-
-            
-    
-
-    async def _cancel_order(self, order_id: int):
-        """Cancel a regular order via /fapi/v1/order."""
-        try:
-            await self._signed_delete("/fapi/v1/order", {
-                "symbol": self.symbol,
-                "orderId": order_id,
-            })
-        except Exception as e:
-            log.debug(f"Cancel order {order_id} failed (may already be filled): {e}")
-
-    async def _verify_order_exists(self, order_id: int) -> bool:
-        try:
-            orders = await self._signed_get("/fapi/v1/openOrders", {"symbol": self.symbol})
-            if not isinstance(orders, list):
-                return False
-            return order_id in [o["orderId"] for o in orders]
-        except Exception as e:
-            log.debug(f"Order verify failed: {e}")
-            return False
-
-    async def _cancel_algo_order(self, algo_id: int):
-        """Cancel an algo order via DELETE /fapi/v1/algoOrder."""
-        try:
-            await self._signed_delete("/fapi/v1/algoOrder", {
-                "symbol": self.symbol,
-                "algoId": algo_id,
-            })
-        except Exception as e:
-            log.debug(f"Cancel algo order {algo_id} failed (may already be filled): {e}")
-
-
-
     # ── Binance signed request helpers ────────────────────────────────────────
 
     def _sign(self, params: dict) -> dict:
         params["timestamp"] = int(time.time() * 1000)
         query = urllib.parse.urlencode(params)
-        sig = hmac.new(
-            self._api_secret.encode(),
-            query.encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        sig = hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = sig
         return params
 
@@ -720,11 +700,5 @@ class QuotingEngine:
             "tick_count": self._tick_count,
             "last_bid": self._last_bid,
             "last_ask": self._last_ask,
-            "bid_order": self._bid_order.order_id if self._bid_order else None,
-            "ask_order": self._ask_order.order_id if self._ask_order else None,
-            "long_tp": self._long_tp.tp_price if self._long_tp else None,
-            "long_sl": self._long_sl.sl_price if self._long_sl else None,
-            "short_tp": self._short_tp.tp_price if self._short_tp else None,
-            "short_sl": self._short_sl.sl_price if self._short_sl else None,
             "realized_pnl": self.realized_pnl,
         }

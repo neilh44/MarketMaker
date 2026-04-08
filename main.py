@@ -98,7 +98,7 @@ async def amain(symbol: str, qty_usd: float, llm_interval: int):
 
     state = SharedState()
     feed = FeedHandler(symbol=symbol, state=state)
-    advisor = LLMAdvisor(state=state, poll_interval=llm_interval)
+    advisor = LLMAdvisor(state=state, interval=llm_interval)
     engine = QuotingEngine(symbol=symbol, state=state, qty_usd=qty_usd)
 
     loop = asyncio.get_event_loop()
