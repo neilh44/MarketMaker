@@ -18,7 +18,10 @@ class ParamsSnapshot:
     paused: bool = False               # if True, quoting engine cancels all and waits
     regime: str = "neutral"            # e.g., "low_vol", "choppy", "trending"
     max_position_usd: float = 50.0     # max notional per side (fallback)
-    
+    gamma:float = 0.01
+    # In MarketSnapshot dataclass
+    state_vector: list = field(default_factory=list)
+
     # === NEW LLM-CONTROLLED FIELDS ===
     action: str = "CONTINUE"           # CONTINUE, PAUSE, CLOSE_LONG, CLOSE_SHORT, FLATTEN
     sl_bps: float = 25.0               # stop-loss distance in bps from entry

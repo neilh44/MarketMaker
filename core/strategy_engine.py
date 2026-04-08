@@ -1,8 +1,8 @@
 """
 strategy_engine.py
 ------------------
-Core market-making loop with LLM supervisory actions,
-dynamic spread/skew, and exit management.
+Core market-making loop with Avellaneda-Stoikov inventory-aware pricing,
+LLM supervisory actions, dynamic spread/skew/gamma, and exit management.
 """
 
 import asyncio
@@ -20,10 +20,11 @@ LEVERAGE = 10
 COMMISSION_BPS = 9.0
 TP_CHECK_INTERVAL = 10.0
 MIN_PRICE_MOVE_BPS = 0.9
-FALLBACK_SPREAD_BPS = 25.0
-FALLBACK_SL_BPS = 25.0
-FALLBACK_TP_BPS = 40.0
+FALLBACK_SPREAD_BPS = 40.0      # increased to ensure profitability
+FALLBACK_SL_BPS = 20.0
+FALLBACK_TP_BPS = 45.0
 FALLBACK_POSITION_MULTIPLE = 1.1
+DEFAULT_GAMMA = 0.01            # risk-aversion coefficient
 
 
 class StrategyEngine:
@@ -105,7 +106,7 @@ class StrategyEngine:
                 await asyncio.sleep(1.0)
                 continue
 
-            # ----- Normal Market Making -----
+            # ----- Normal Market Making with AS Pricing -----
             await self._requote(market.mid, params)
 
             # ----- Periodic TP/SL Sync -----
@@ -121,22 +122,23 @@ class StrategyEngine:
         self._running = False
 
     # ------------------------------------------------------------------
-    # Quote calculation & entry management
+    # Avellaneda-Stoikov (AS) pricing model
     # ------------------------------------------------------------------
-    def _compute_quotes(self, mid: float, spread_bps: float, skew: float) -> tuple[float, float]:
-        half = (spread_bps / 10_000) / 2 * mid
-        bid = mid - half * (1 + skew)
-        ask = mid + half * (1 - skew)
-        if mid >= 1:
-            precision = 4
-        elif mid >= 0.1:
-            precision = 5
-        elif mid >= 0.01:
-            precision = 6
-        elif mid >= 0.001:
-            precision = 7
-        else:
-            precision = 8
+
+    def _compute_as_quotes(self, mid: float, spread_bps: float, gamma: float) -> tuple[float, float]:
+        net_inventory = self.tracker.long_qty - self.tracker.short_qty
+        reservation = mid - gamma * net_inventory
+        half_spread = (spread_bps / 10_000) / 2 * mid
+
+        bid = max(reservation - half_spread, mid * 0.9)   # 不低于 mid 的 90%
+        ask = min(reservation + half_spread, mid * 1.1)   # 不高于 mid 的 110%
+
+        if mid >= 1: precision = 4
+        elif mid >= 0.1: precision = 5
+        elif mid >= 0.01: precision = 6
+        elif mid >= 0.001: precision = 7
+        else: precision = 8
+
         return round(bid, precision), round(ask, precision)
 
     def _has_moved(self, new_bid: float, new_ask: float, mid: float) -> bool:
@@ -164,6 +166,9 @@ class StrategyEngine:
             return round(price, 7)
         return round(price, 8)
 
+    # ------------------------------------------------------------------
+    # Quoting entry orders
+    # ------------------------------------------------------------------
     async def _requote(self, mid: float, params):
         now = time.time()
         if now - self._last_quote_time < self._min_quote_interval:
@@ -179,10 +184,13 @@ class StrategyEngine:
             log.debug("Skipping quote – insufficient free margin")
             return
 
-        spread_bps = getattr(params, 'spread_bps', FALLBACK_SPREAD_BPS)
-        skew = getattr(params, 'skew', 0.0)
+        # Get parameters from LLM with hard floors
+        spread_bps = max(getattr(params, 'spread_bps', FALLBACK_SPREAD_BPS), 30.0)
+        gamma = getattr(params, 'gamma', DEFAULT_GAMMA)
 
-        bid_price, ask_price = self._compute_quotes(mid, spread_bps, skew)
+        # Compute inventory-aware quotes
+        bid_price, ask_price = self._compute_as_quotes(mid, spread_bps, gamma)
+
         if not self._has_moved(bid_price, ask_price, mid):
             return
 
@@ -198,7 +206,11 @@ class StrategyEngine:
             self._consecutive_failures = 0
             self._last_bid = bid_price
             self._last_ask = ask_price
-            log.debug(f"Quoted BID={bid_price} ASK={ask_price} spread={(ask_price-bid_price)/mid*10000:.1f}bps qty={qty}")
+            log.debug(
+                f"Quoted BID={bid_price} ASK={ask_price} "
+                f"spread={(ask_price-bid_price)/mid*10000:.1f}bps "
+                f"net_inv={self.tracker.long_qty - self.tracker.short_qty:.0f} gamma={gamma:.3f}"
+            )
         else:
             self._consecutive_failures += 1
             backoff = min(2 ** self._consecutive_failures, 60)
@@ -246,8 +258,8 @@ class StrategyEngine:
             return
         self.tracker.update_from_api(positions, self.symbol)
 
-        tp_bps = getattr(params, 'tp_bps', FALLBACK_TP_BPS)
-        sl_bps = getattr(params, 'sl_bps', FALLBACK_SL_BPS)
+        tp_bps = max(getattr(params, 'tp_bps', FALLBACK_TP_BPS), 30.0)
+        sl_bps = max(getattr(params, 'sl_bps', FALLBACK_SL_BPS), 15.0)
 
         await self._sync_long_exit(tp_bps, sl_bps)
         await self._sync_short_exit(tp_bps, sl_bps)
